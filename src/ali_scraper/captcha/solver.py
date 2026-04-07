@@ -205,152 +205,32 @@ class CaptchaSolver:
         return None
 
     async def _vision_engine_distance(self, page) -> float | None:
-        """Use CapSolver VisionEngine slider_1 to find the NC slider drag distance.
+        """Use CapSolver VisionEngine slider_1 to find accurate drag distance.
 
-        Extraction priority:
-        1. Intercepted NC image URLs captured from network traffic
-        2. Canvas elements rendered inside the NC widget
-        3. CSS background-image URLs fetched via HTTP
-        4. DOM element screenshots
+        Extracts the background (hole) image and the puzzle piece image from the
+        NC CAPTCHA widget, then sends both to VisionEngine. Returns the distance
+        in pixels, or None if extraction fails.
+
+        VisionEngine createTask is synchronous — result arrives directly in the
+        createTask response (no polling needed).
         """
         try:
-            # Wait for NC widget canvas to finish rendering
-            await page.wait_for_timeout(3000)
+            # Try to screenshot individual NC elements for best accuracy
+            bg_loc = page.locator(NC_BG_SELECTORS).first
+            piece_loc = page.locator(NC_PIECE_SELECTORS).first
 
-            bg_bytes: bytes | None = None
-            piece_bytes: bytes | None = None
-            method = "none"
+            bg_visible = await bg_loc.count() > 0 and await bg_loc.is_visible()
+            piece_visible = await piece_loc.count() > 0 and await piece_loc.is_visible()
 
-            # --- Method 0: Use network-intercepted NC image URLs ---
-            intercepted: list[str] = getattr(self, "_last_intercepted_nc_urls", [])
-            if len(intercepted) >= 2:
-                async with httpx.AsyncClient(timeout=15) as client:
-                    try:
-                        r = await client.get(intercepted[0])
-                        if r.is_success:
-                            bg_bytes = r.content
-                        r = await client.get(intercepted[1])
-                        if r.is_success:
-                            piece_bytes = r.content
-                        method = "intercepted"
-                        logger.debug("NC images from intercepted URLs")
-                    except Exception as e:
-                        logger.debug("Intercepted URL fetch failed: %s", e)
-                        bg_bytes = piece_bytes = None
-            elif len(intercepted) == 1:
-                async with httpx.AsyncClient(timeout=15) as client:
-                    try:
-                        r = await client.get(intercepted[0])
-                        if r.is_success:
-                            bg_bytes = r.content
-                        method = "intercepted_bg_only"
-                    except Exception:
-                        pass
-
-            # --- Method 1: Export canvases from the NC widget ---
-            if not bg_bytes or not piece_bytes:
-                canvas_data = await page.evaluate("""
-                    () => {
-                        const containers = [
-                            document.querySelector('#nc_1_wrapper'),
-                            document.querySelector('.nc-container'),
-                            document.querySelector('#baxia-dialog-content'),
-                            document.querySelector('[id*="nc_"]'),
-                        ].filter(Boolean);
-
-                        for (const container of containers) {
-                            const canvases = Array.from(container.querySelectorAll('canvas'));
-                            if (canvases.length >= 2) {
-                                try {
-                                    return {
-                                        bg: canvases[0].toDataURL('image/png').split(',')[1],
-                                        piece: canvases[1].toDataURL('image/png').split(',')[1],
-                                        method: 'canvas_2',
-                                    };
-                                } catch(e) {}
-                            }
-                            if (canvases.length === 1) {
-                                try {
-                                    const bg_b64 = canvases[0].toDataURL('image/png').split(',')[1];
-                                    const pieceImg = container.querySelector('img[src*="slice"], img[src*="piece"], .nc_slice img, #nc_1_slice img');
-                                    if (pieceImg && pieceImg.complete) {
-                                        const cv = document.createElement('canvas');
-                                        cv.width = pieceImg.naturalWidth; cv.height = pieceImg.naturalHeight;
-                                        cv.getContext('2d').drawImage(pieceImg, 0, 0);
-                                        return { bg: bg_b64, piece: cv.toDataURL('image/png').split(',')[1], method: 'canvas_1_img' };
-                                    }
-                                    return { bg: bg_b64, piece: null, method: 'canvas_1_only' };
-                                } catch(e) {}
-                            }
-                        }
-
-                        // --- Method 2: CSS background-image URLs ---
-                        const bgEl = document.querySelector('#nc_1_bg, .nc_bg, .nc-bg-img, #baxia-dialog-content');
-                        const pieceEl = document.querySelector('#nc_1_slice, .nc_slice, .nc-slide-piece, #nc_1_jigsaw');
-                        const bgStyle = bgEl ? window.getComputedStyle(bgEl).backgroundImage : '';
-                        const pieceStyle = pieceEl ? window.getComputedStyle(pieceEl).backgroundImage : '';
-                        const urlRe = /url\(["']?([^"')]+)["']?\)/;
-                        const bgUrl = bgStyle.match(urlRe)?.[1] || bgEl?.src || null;
-                        const pieceUrl = pieceStyle.match(urlRe)?.[1] || pieceEl?.src || null;
-                        if (bgUrl) return { bgUrl, pieceUrl, method: 'css_url' };
-
-                        return { method: 'none' };
-                    }
-                """)
-
-                canvas_method = canvas_data.get("method", "none")
-                logger.debug("NC canvas extraction method: %s", canvas_method)
-
-                if canvas_method in ("canvas_2", "canvas_1_img") and canvas_data.get("bg") and canvas_data.get("piece"):
-                    if not bg_bytes:
-                        bg_bytes = base64.b64decode(canvas_data["bg"])
-                    if not piece_bytes:
-                        piece_bytes = base64.b64decode(canvas_data["piece"])
-                    method = canvas_method
-
-                elif canvas_method == "canvas_1_only" and canvas_data.get("bg") and not bg_bytes:
-                    bg_bytes = base64.b64decode(canvas_data["bg"])
-                    piece_loc = page.locator(NC_PIECE_SELECTORS).first
-                    if await piece_loc.count() > 0 and await piece_loc.is_visible():
-                        piece_bytes = await piece_loc.screenshot()
-                    method = canvas_method
-
-                elif canvas_method == "css_url":
-                    async with httpx.AsyncClient(timeout=15) as client:
-                        if canvas_data.get("bgUrl") and not bg_bytes:
-                            try:
-                                r = await client.get(canvas_data["bgUrl"])
-                                if r.is_success:
-                                    bg_bytes = r.content
-                            except Exception:
-                                pass
-                        if canvas_data.get("pieceUrl") and not piece_bytes:
-                            try:
-                                r = await client.get(canvas_data["pieceUrl"])
-                                if r.is_success:
-                                    piece_bytes = r.content
-                            except Exception:
-                                pass
-                    method = "css_url"
-
-            # --- Method 3: DOM element screenshots ---
-            if not bg_bytes:
-                bg_loc = page.locator(NC_BG_SELECTORS).first
-                if await bg_loc.count() > 0 and await bg_loc.is_visible():
-                    bg_bytes = await bg_loc.screenshot()
-                    method = "dom_screenshot"
-            if not piece_bytes:
-                piece_loc = page.locator(NC_PIECE_SELECTORS).first
-                if await piece_loc.count() > 0 and await piece_loc.is_visible():
-                    piece_bytes = await piece_loc.screenshot()
-
-            # --- Last resort: full page screenshot ---
-            if not bg_bytes:
-                bg_bytes = await page.screenshot(full_page=False)
-                method = "fullpage_fallback"
-                logger.warning("VisionEngine: using full-page screenshot — result may be inaccurate")
-            if not piece_bytes:
-                piece_bytes = bg_bytes  # same image; distance likely won't be found
+            if bg_visible and piece_visible:
+                bg_bytes = await bg_loc.screenshot()
+                piece_bytes = await piece_loc.screenshot()
+            else:
+                # Fallback: crop from full-page screenshot — send same image for both
+                logger.debug("NC element screenshots unavailable; using full screenshot")
+                full = await page.screenshot(full_page=False)
+                bg_bytes = full
+                piece_bytes = full
 
             b64_bg = base64.b64encode(bg_bytes).decode()
             b64_piece = base64.b64encode(piece_bytes).decode()
@@ -358,8 +238,8 @@ class CaptchaSolver:
             task = {
                 "type": "VisionEngine",
                 "module": "slider_1",
-                "image": b64_piece,
-                "imageBackground": b64_bg,
+                "image": b64_piece,          # the puzzle piece
+                "imageBackground": b64_bg,   # the background with the hole
                 "websiteURL": page.url,
             }
 
@@ -374,12 +254,10 @@ class CaptchaSolver:
                 return None
 
             solution = data.get("solution") or {}
-            logger.debug("VisionEngine raw solution: %s", solution)
             distance = solution.get("distance")
             if distance:
-                logger.info("VisionEngine returned distance=%.0f px (method=%s)", float(distance), method)
+                logger.info("VisionEngine returned distance=%.0f px", distance)
                 return float(distance)
-            logger.warning("VisionEngine returned no distance (method=%s). Full solution: %s", method, solution)
 
         except Exception as e:
             logger.error("VisionEngine call failed: %s", e)
@@ -397,47 +275,58 @@ class CaptchaSolver:
         logger.info("CAPTCHA detected — warming up mouse")
         await _warmup_mouse(page)
 
-        # Strategy 1: free drag — auto-measured distance first
+        # Strategy 1: free drag — try auto-measured distance, then fallback distances
         if await drag_slider(page):
             return True
-        if not await detect_captcha(page):
-            return True
 
-        # Strategy 2: VisionEngine gives the hole position in the background image.
-        # The returned `distance` is the x-offset of the hole in the BG image.
-        # We need to account for the slider handle's starting x within the track,
-        # so try the raw distance and scaled variants.
-        logger.info("Free drag failed — querying CapSolver VisionEngine for distance")
-        ve_distance = await self._vision_engine_distance(page)
-        if ve_distance:
-            # Try the raw VisionEngine distance and scaled variants to handle
-            # CSS pixel vs rendered pixel differences and handle start offset
-            for scale in [1.0, 0.85, 0.9, 1.1, 0.75, 1.2]:
-                if not await detect_captcha(page):
-                    return True
-                attempt_dist = ve_distance * scale
-                logger.info("Attempting drag: VisionEngine %.0f × %.2f = %.0f px", ve_distance, scale, attempt_dist)
-                await _warmup_mouse(page)
-                if await drag_slider(page, distance=attempt_dist):
-                    return True
-                await page.wait_for_timeout(1200)
-
-        # Strategy 3: brute-force common Alibaba NC slider distances
-        logger.info("VisionEngine attempts exhausted — trying fixed distances")
-        for dist in [280, 310, 260, 340, 230, 370, 200]:
+        # Retry with different distances in case auto-measure was wrong
+        for alt_dist in [280, 340, 260]:
             if not await detect_captcha(page):
                 return True
+            logger.debug("Retrying free drag at %dpx", alt_dist)
             await _warmup_mouse(page)
-            if await drag_slider(page, distance=dist):
+            if await drag_slider(page, distance=alt_dist):
                 return True
-            await page.wait_for_timeout(800)
 
-        logger.warning("All CAPTCHA solve strategies failed")
-        return False
+        # Strategy 2: VisionEngine gives accurate pixel distance, then drag
+        logger.info("Free drag failed — querying CapSolver VisionEngine for distance")
+        distance = await self._vision_engine_distance(page)
+        if distance:
+            logger.info("Attempting drag with VisionEngine distance=%.0f px", distance)
+            if await drag_slider(page, distance=distance):
+                return True
+
+        # Strategy 3: fallback to full-screenshot AntiSliderTaskByImage
+        logger.info("VisionEngine drag failed — falling back to AntiSliderTaskByImage")
+        return await self._solve_by_screenshot(page)
 
     async def _solve_by_screenshot(self, page) -> bool:
-        """Kept for backward compatibility — delegates to solve_slider."""
-        return await self.solve_slider(page)
+        """Legacy fallback: full screenshot → AntiSliderTaskByImage → drag."""
+        try:
+            slider_btn = page.locator(SLIDER_SELECTORS).first
+            screenshot = await page.screenshot(full_page=False)
+            b64_image = base64.b64encode(screenshot).decode()
+
+            task = {
+                "type": "AntiSliderTaskByImage",
+                "image": b64_image,
+            }
+            task_id = await self._create_task(task)
+            if not task_id:
+                return await self._try_recaptcha(page)
+
+            solution = await self._get_result(task_id)
+            if not solution:
+                return False
+
+            slide_x = solution.get("slideX") or solution.get("distance", 0)
+            if slide_x:
+                return await drag_slider(page, distance=float(slide_x))
+
+        except Exception as e:
+            logger.error("AntiSliderTaskByImage solve failed: %s", e)
+
+        return False
 
     async def _try_recaptcha(self, page) -> bool:
         """Fallback: check for reCAPTCHA iframe and solve via CapSolver."""

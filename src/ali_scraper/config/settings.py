@@ -45,6 +45,7 @@ class _Settings:
     DETAIL_DELAY_MAX: int = int(os.getenv("DETAIL_DELAY_MAX", "20"))
     MAX_CAPTCHA_RETRIES: int = int(os.getenv("MAX_CAPTCHA_RETRIES", "2"))
     DETAIL_WORKERS: int = int(os.getenv("DETAIL_WORKERS", "3"))
+    DETAIL_LIMIT: int = int(os.getenv("DETAIL_LIMIT", "-1"))  # -1 = scrape all details
     FORCE_RESCRAPE: bool = os.getenv("FORCE_RESCRAPE", "false").lower() == "true"
     STORE_FAILED_PRODUCTS: bool = os.getenv("STORE_FAILED_PRODUCTS", "false").lower() == "true"
 

@@ -159,10 +159,23 @@ async def run():
             url_to_load = next_url
 
             page_ok = False
-            # Retry the same listing page up to 3 proxies, then once without proxy
+            # Retry the same listing page up to 3 proxies, then once without proxy.
+            # If an HTTPS tunnel error is detected we skip remaining proxies immediately.
             max_listing_attempts = (min(3, len(proxies)) + 1) if proxies else 1
+            _use_direct = not proxies  # start direct when no proxies configured
             for _attempt in range(max_listing_attempts):
-                if _attempt == max_listing_attempts - 1 and proxies:
+                if _use_direct:
+                    if _attempt > 0:
+                        logger.info("Listing page %d: all proxy attempts failed — trying direct", page_num)
+                    ctx_opts = {
+                        "user_agent": scraper.pick_ua(),
+                        "viewport": {"width": 1920, "height": 1080},
+                        "locale": "en-US",
+                        "timezone_id": "Europe/Stockholm",
+                        "geolocation": {"latitude": 59.3293, "longitude": 18.0686},
+                        "permissions": ["geolocation"],
+                    }
+                elif _attempt == max_listing_attempts - 1:
                     logger.info("Listing page %d: all proxy attempts failed — trying direct", page_num)
                     ctx_opts = {
                         "user_agent": scraper.pick_ua(),
@@ -195,11 +208,19 @@ async def run():
                     logger.info("Listing page %d: got %d products via %s", page_num, len(new_prods), proxy_label)
                     break
                 except Exception as e:
-                    logger.warning("Listing page %d attempt %d failed: %s", page_num, _attempt + 1, e)
+                    err_str = str(e)
+                    logger.warning("Listing page %d attempt %d failed: %s", page_num, _attempt + 1, err_str[:300])
                     try:
                         await context.close()
                     except Exception:
                         pass
+                    # Backbone proxies can't tunnel HTTPS — skip all remaining proxy retries
+                    if "ERR_TUNNEL_CONNECTION_FAILED" in err_str and not _use_direct:
+                        logger.info(
+                            "Listing page %d: HTTPS tunnel error — switching to direct for remaining attempts",
+                            page_num,
+                        )
+                        _use_direct = True
 
             if not page_ok:
                 logger.error("Listing page %d failed all attempts — stopping pagination", page_num)
@@ -223,6 +244,14 @@ async def run():
                 "New products: %d (skipped %d existing)",
                 len(new_raw), len(raw_products) - len(new_raw),
             )
+
+        # Apply detail limit if configured
+        if settings.DETAIL_LIMIT != -1 and len(new_raw) > settings.DETAIL_LIMIT:
+            logger.info(
+                "DETAIL_LIMIT=%d — capping detail scraping to first %d of %d products",
+                settings.DETAIL_LIMIT, settings.DETAIL_LIMIT, len(new_raw),
+            )
+            new_raw = new_raw[:settings.DETAIL_LIMIT]
 
         # --- Phase 2: Detail pages (if enabled) ---
         details_map: dict[str, dict] = {}

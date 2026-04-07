@@ -135,9 +135,42 @@ class AlibabaScraper:
 
     @staticmethod
     def extract_price_range(text: str) -> tuple[float, float]:
-        """Extract low and high price from text like '$780-1,500'."""
-        nums = re.findall(r'[\d,]+\.?\d*', text)
-        cleaned = [float(n.replace(',', '')) for n in nums]
+        """Extract low and high price from text like '$780-1,500' or European '4.000-6.000'.
+
+        Handles both US format (comma = thousands, dot = decimal) and
+        European format (dot = thousands, comma = decimal).
+        """
+        segments = re.findall(r'[\d.,]+', text)
+        cleaned: list[float] = []
+        for seg in segments:
+            if not any(c.isdigit() for c in seg):
+                continue
+            has_comma = ',' in seg
+            has_dot = '.' in seg
+            try:
+                if has_comma and has_dot:
+                    # Whichever separator appears last is the decimal separator
+                    if seg.rfind('.') > seg.rfind(','):
+                        val = float(seg.replace(',', ''))            # US: 1,000.50
+                    else:
+                        val = float(seg.replace('.', '').replace(',', '.'))  # EU: 1.000,50
+                elif has_comma:
+                    after = seg.rsplit(',', 1)[1]
+                    if len(after) == 3:
+                        val = float(seg.replace(',', ''))            # US thousands: 1,500
+                    else:
+                        val = float(seg.replace(',', '.'))          # EU decimal: 1,50
+                elif has_dot:
+                    after = seg.rsplit('.', 1)[1]
+                    if len(after) == 3:
+                        val = float(seg.replace('.', ''))            # EU thousands: 4.000
+                    else:
+                        val = float(seg)                            # standard decimal: 4.50
+                else:
+                    val = float(seg)
+            except ValueError:
+                continue
+            cleaned.append(val)
         if len(cleaned) >= 2:
             return cleaned[0], cleaned[1]
         elif len(cleaned) == 1:
@@ -215,16 +248,38 @@ class AlibabaScraper:
         """Scrape one listing page. Returns (products, next_page_url_or_None)."""
         logger.info("Listing page %d – loading %s", page_num, url[:80])
 
-        # Set up network interceptor to capture NC captcha image URLs before load
+        # Set up network interceptor to capture NC captcha image URLs/bytes before load
         intercepted_nc_urls: list[str] = []
+        intercepted_nc_bytes: list[bytes] = []
 
         async def _capture_nc_images(response):
             rurl = response.url
-            # Alibaba NC captcha loads puzzle images from aliyun CDN
-            if any(x in rurl for x in ("nocaptcha", "nc_", "punish", "captcha")) and \
-               any(rurl.endswith(ext) for ext in (".jpg", ".png", ".jpeg", ".webp")):
-                intercepted_nc_urls.append(rurl)
-                logger.debug("Intercepted NC image: %s", rurl[:80])
+            content_type = response.headers.get("content-type", "")
+            is_image = content_type.startswith("image/") or any(
+                f".{ext}" in rurl.split("?")[0].lower()
+                for ext in ("jpg", "jpeg", "png", "webp")
+            )
+            if not is_image:
+                return
+            # Alibaba NC captcha puzzle images — URL may not contain obvious keywords
+            # Match known NC patterns AND generic alicdn.com paths loaded during captcha phase
+            is_nc_related = any(x in rurl for x in (
+                "nocaptcha", "nc_", "punish", "captcha", "baxia", "aliyundun",
+                "slide", "puzzle", "verify",
+            ))
+            if not is_nc_related:
+                return
+            # Try to store the actual bytes so we don't need to re-download later
+            try:
+                body = await response.body()
+                if body and 500 < len(body) < 2_000_000:
+                    intercepted_nc_bytes.append(body)
+                    logger.debug("Captured NC image bytes (%d B): %s", len(body), rurl[:80])
+                    return
+            except Exception:
+                pass
+            intercepted_nc_urls.append(rurl)
+            logger.debug("Intercepted NC image URL: %s", rurl[:80])
 
         page.on("response", _capture_nc_images)
 
@@ -235,8 +290,13 @@ class AlibabaScraper:
         if captcha_solver:
             from ..captcha.solver import detect_captcha
             if await detect_captcha(page):
-                logger.info("Listing page %d: CAPTCHA detected — solving (intercepted %d NC images)", page_num, len(intercepted_nc_urls))
-                if intercepted_nc_urls:
+                logger.info(
+                    "Listing page %d: CAPTCHA detected — solving (intercepted %d NC images, %d bytes)",
+                    page_num, len(intercepted_nc_urls), len(intercepted_nc_bytes),
+                )
+                if intercepted_nc_bytes:
+                    captcha_solver._last_intercepted_nc_bytes = intercepted_nc_bytes
+                elif intercepted_nc_urls:
                     captcha_solver._last_intercepted_nc_urls = intercepted_nc_urls
                 solved = await captcha_solver.solve_slider(page)
                 if solved:
@@ -809,6 +869,19 @@ class AlibabaScraper:
         title = raw.get("title", "")
         price_text = raw.get("priceText", "") or raw.get("priceTitle", "")
         price_low, price_high = AlibabaScraper.extract_price_range(price_text)
+
+        # Prefer priceTiers from detail page — they are more accurate than listing DOM text.
+        # Use the tier with the lowest minimum quantity (i.e. the single-unit price).
+        if detail:
+            tiers = detail.get("priceTiers") or []
+            if tiers:
+                # Sort by min quantity ascending; pick the first tier's price
+                sorted_tiers = sorted(tiers, key=lambda t: t.get("min", 0))
+                tier_price = sorted_tiers[0].get("price", 0)
+                if tier_price and tier_price > 0:
+                    price_low = tier_price
+                    # High price = largest-quantity (bulk) tier
+                    price_high = sorted_tiers[-1].get("price", tier_price) or price_low
 
         # Use detail title if longer/better
         if detail.get("title") and len(detail["title"]) > len(title):
