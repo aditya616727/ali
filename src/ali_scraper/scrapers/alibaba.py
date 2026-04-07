@@ -466,256 +466,388 @@ class AlibabaScraper:
     # Detail page scraper — extracts from window.detailData JS object
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _to_store_url(url: str) -> str | None:
+        """Convert www.alibaba.com detail URL to kukirin.en.alibaba.com URL.
+
+        Store-subdomain URLs typically skip CAPTCHA because the session
+        already has cookies from the listing-page crawl on the same domain.
+        """
+        m = re.search(r'/product-detail/([^?#]+)', url)
+        if m:
+            slug = m.group(1)
+            return f"{settings.BASE_URL}/product/{slug}"
+        return None
+
     async def scrape_detail_page(self, page: Page, url: str, captcha_solver=None) -> dict | None:
-        """Navigate to a product detail page, solve CAPTCHA if needed, extract data."""
-        logger.info("Detail page – loading %s", url[:80])
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(5000)
-        except Exception as e:
-            logger.warning("Failed to load detail page %s: %s", url[:60], e)
-            return None
+        """Navigate to a product detail page, solve CAPTCHA if needed, extract data.
 
-        # --- Solve CAPTCHA if present ---
-        if captcha_solver:
-            for attempt in range(settings.MAX_CAPTCHA_RETRIES):
-                solved = await captcha_solver.solve_slider(page)
-                if solved:
-                    break
-                logger.warning("CAPTCHA solve attempt %d failed for %s", attempt + 1, url[:60])
-                if attempt < settings.MAX_CAPTCHA_RETRIES - 1:
-                    await page.reload(wait_until="domcontentloaded")
-                    await page.wait_for_timeout(3000)
-            else:
-                logger.error("All CAPTCHA attempts failed for %s — skipping", url[:60])
-                return None
+        Strategy order:
+        1. Try direct www.alibaba.com URL first (has full detailData with specs)
+        2. Fall back to store-subdomain URL if direct gets CAPTCHA-blocked
+        3. If CAPTCHA appears, attempt to solve it
+        """
+        urls_to_try = []
+        # Try direct URL first — has full detailData with specs/attrs
+        # The warm context (with store cookies) should reduce CAPTCHA risk
+        urls_to_try.append(("direct", url))
+        store_url = self._to_store_url(url)
+        if store_url:
+            urls_to_try.append(("store", store_url))
 
-        if await detect_captcha(page):
-            logger.warning("CAPTCHA still present after solving for %s — triggering proxy retry", url[:60])
-            return None
-
-        # Wait for product content — prefer window.detailData (React SPA),
-        # fall back to common DOM selectors
-        content_ready = False
-        try:
-            await page.wait_for_function(
-                "() => !!(window.detailData && window.detailData.globalData)",
-                timeout=20000,
-            )
-            content_ready = True
-        except Exception:
-            # Fallback: wait for any visible product heading
+        for label, target_url in urls_to_try:
+            logger.info("Detail page [%s] – loading %s", label, target_url[:90])
             try:
-                await page.wait_for_selector(
-                    "h1, .product-title, .title, .detail-header-title, "
-                    "[data-spm='title'], .product-info, .module-pdp-title",
-                    timeout=10000,
+                resp = await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(3000)
+            except Exception as e:
+                logger.warning("  Failed to load [%s] %s: %s", label, target_url[:60], e)
+                continue
+
+            # Check for CAPTCHA
+            if await detect_captcha(page):
+                logger.info("  CAPTCHA on [%s] — attempting solve", label)
+                solved = False
+                if captcha_solver:
+                    for attempt in range(settings.MAX_CAPTCHA_RETRIES):
+                        solved = await captcha_solver.solve_slider(page)
+                        if solved:
+                            break
+                        logger.warning("  CAPTCHA attempt %d failed", attempt + 1)
+                        if attempt < settings.MAX_CAPTCHA_RETRIES - 1:
+                            await page.reload(wait_until="domcontentloaded")
+                            await page.wait_for_timeout(3000)
+                if not solved and await detect_captcha(page):
+                    logger.warning("  CAPTCHA unsolved on [%s] — trying next URL", label)
+                    continue
+
+            # Wait for product content — try multiple JS data objects & DOM
+            content_ready = False
+            try:
+                await page.wait_for_function(
+                    """() => !!(
+                        (window.detailData && window.detailData.globalData) ||
+                        window.runParams ||
+                        window.__INIT_DATA__ ||
+                        window.PAGE_DATA ||
+                        document.querySelector('h1, .product-title, .module-pdp-title')
+                    )""",
+                    timeout=20000,
                 )
                 content_ready = True
             except Exception:
-                pass
+                try:
+                    await page.wait_for_selector(
+                        "h1, .product-title, .module-pdp-title, "
+                        "[class*='product-name'], [class*='gallery'], "
+                        ".detail-header-title, .product-info",
+                        timeout=10000,
+                    )
+                    content_ready = True
+                except Exception:
+                    pass
 
-        if not content_ready:
-            logger.warning("Product content did not appear for %s", url[:60])
-            try:
-                import os
-                os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
-                slug = url.rstrip("/").split("/")[-1][:40]
-                await page.screenshot(path=f"{settings.OUTPUT_DIR}/debug_{slug}.png")
-            except Exception:
-                pass
-            return None
+            if not content_ready:
+                logger.warning("  Content not ready on [%s] for %s", label, target_url[:60])
+                continue
 
-        # Scroll to trigger lazy-load
-        for _ in range(4):
-            await page.evaluate("window.scrollBy(0, window.innerHeight)")
-            await page.wait_for_timeout(800)
+            # Success — proceed to extraction
+            logger.info("  Content ready via [%s]", label)
 
-        # --- Extract structured data from window.detailData ---
-        detail = await page.evaluate("""() => {
-            const dd = window.detailData;
-            if (!dd || !dd.globalData) return null;
+            # Scroll aggressively to trigger lazy-load of images, desc, specs
+            for _ in range(8):
+                await page.evaluate("window.scrollBy(0, window.innerHeight)")
+                await page.wait_for_timeout(700)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(1500)
 
-            const gd = dd.globalData;
-            const product = gd.product || {};
-            const seller = gd.seller || {};
-            const trade = gd.trade || {};
-            const nm = dd.nodeMap || {};
-            const result = {};
+            # --- Extract structured data — try multiple JS sources ---
+            detail = await self._extract_js_data(page)
 
-            // --- Title ---
-            result.title = product.subject || '';
-            if (!result.title) {
-                const h1 = document.querySelector('h1');
-                if (h1) result.title = h1.innerText.trim();
+            if detail:
+                logger.info(
+                    "  JS data via %s: title=%s, imgs=%d, attrs=%d, skuAttrs=%d",
+                    detail.get("_source", "?"),
+                    bool(detail.get("title")),
+                    len(detail.get("images", [])),
+                    len(detail.get("attributes", {})),
+                    len(detail.get("skuAttributes", [])),
+                )
+            else:
+                logger.warning("  No JS data — falling back to DOM for %s", target_url[:60])
+                detail = await self._extract_from_dom(page)
+
+            # Enrich: always supplement images from DOM if JS gave few
+            if detail and len(detail.get("images", [])) < 2:
+                dom_images = await self._extract_gallery_images_from_dom(page)
+                if dom_images and len(dom_images) > len(detail.get("images", [])):
+                    detail["images"] = dom_images
+
+            # Enrich: always try DOM attributes (JS data may have missed some)
+            if detail:
+                dom_attrs = await self._extract_attributes_from_dom(page)
+                if dom_attrs:
+                    logger.info("  DOM attrs found: %d", len(dom_attrs))
+                    existing = detail.get("attributes", {})
+                    for k, v in dom_attrs.items():
+                        if k not in existing:
+                            existing[k] = v
+                    detail["attributes"] = existing
+
+            if detail:
+                desc_text = await self._extract_description(page)
+                if desc_text:
+                    detail["description"] = desc_text
+
+                # Pull description images into gallery if we have very few
+                if len(detail.get("images", [])) < 3:
+                    desc_imgs = await self._extract_description_images(page)
+                    existing = set(detail.get("images", []))
+                    for img in (desc_imgs or []):
+                        if img not in existing:
+                            detail.setdefault("images", []).append(img)
+                            existing.add(img)
+
+                detail["source_url"] = url
+                logger.info(
+                    "  Detail extracted: %s | %d images | %d attrs | %d variants | desc=%d chars",
+                    (detail.get("title") or "?")[:50],
+                    len(detail.get("images", [])),
+                    len(detail.get("attributes", {})),
+                    len(detail.get("skuAttributes", [])),
+                    len(detail.get("description", "")),
+                )
+            return detail
+
+        # All URL attempts failed
+        logger.error("All detail page attempts failed for %s", url[:60])
+        try:
+            import os
+            os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
+            slug = url.rstrip("/").split("/")[-1][:40]
+            await page.screenshot(path=f"{settings.OUTPUT_DIR}/debug_{slug}.png")
+        except Exception:
+            pass
+        return None
+
+    # ------------------------------------------------------------------
+    # JS data extraction — tries 5 sources
+    # ------------------------------------------------------------------
+
+    async def _extract_js_data(self, page: Page) -> dict | None:
+        """Extract product data from JS globals on the page."""
+        return await page.evaluate("""() => {
+            function upgradeImg(url) {
+                if (!url) return '';
+                url = url.replace(/_\\d+x\\d+\\.\\w+(\\?.*)?$/, '');
+                if (url.startsWith('//')) url = 'https:' + url;
+                return url;
             }
 
-            // --- Product ID ---
-            result.productId = product.productId || '';
+            function extract(product, seller, trade, nodeMap) {
+                const result = {};
+                const nm = nodeMap || {};
+                seller = seller || {};
+                trade = trade || {};
 
-            // --- Images (full resolution from mediaItems) ---
-            const images = [];
-            (product.mediaItems || []).forEach(m => {
-                if (m.type === 'image' && m.imageUrl) {
-                    const url = typeof m.imageUrl === 'object' ? m.imageUrl.big : m.imageUrl;
-                    if (url) images.push(url);
+                // Title
+                result.title = product.subject || product.title || '';
+                if (!result.title) {
+                    const h1 = document.querySelector('h1');
+                    if (h1) result.title = h1.innerText.trim();
                 }
-            });
-            result.images = images;
+                result.productId = product.productId || product.id || '';
 
-            // --- Price tiers ---
-            const price = product.price || product.customPrice || {};
-            result.priceTiers = (price.productLadderPrices || []).map(t => ({
-                min: t.min,
-                max: t.max,
-                price: t.price || t.dollarPrice,
-                formatted: t.formatPrice || ''
-            }));
-            result.priceRange = price.formatLadderPrice || '';
-
-            // --- SKU attributes & variants ---
-            const sku = product.sku || {};
-            const skuAttrs = sku.skuAttrs || sku.skuSummaryAttrs || [];
-            result.skuAttributes = skuAttrs.map(a => ({
-                name: a.name || '',
-                values: (a.values || []).map(v => ({
-                    id: v.id,
-                    name: v.name || '',
-                    color: v.color || '',
-                    imageUrl: v.imageUrl || ''
-                }))
-            }));
-
-            // SKU combos (attribute IDs -> SKU ID)
-            result.skuInfoMap = sku.skuInfoMap || {};
-
-            // --- Product attributes (specs) ---
-            const attrs = {};
-            const basicProps = product.productBasicProperties || [];
-            const otherProps = product.productOtherProperties || [];
-            const allProps = [...basicProps, ...otherProps];
-            const seen = new Set();
-            allProps.forEach(p => {
-                const k = (p.attrName || '').trim();
-                const v = (p.attrValue || '').trim();
-                if (k && v && !seen.has(k)) {
-                    seen.add(k);
-                    attrs[k] = v;
-                }
-            });
-
-            // Also include sorted attributes from nodeMap
-            const sortedAttr = nm.module_sorted_attribute;
-            if (sortedAttr && sortedAttr.privateData) {
-                const sorted = sortedAttr.privateData.productSortedProperties || [];
-                sorted.forEach(group => {
-                    (group.attributeList || []).forEach(a => {
-                        const k = (a.attribute || '').trim();
-                        const v = (a.value || '').trim();
-                        if (k && v && !seen.has(k)) {
-                            seen.add(k);
-                            attrs[k] = v;
-                        }
-                    });
-                });
-            }
-            result.attributes = attrs;
-
-            // --- Key industry properties (highlighted specs) ---
-            result.keyProperties = (product.productKeyIndustryProperties || []).map(
-                p => ({ name: p.attrName, value: p.attrValue })
-            );
-
-            // --- Supplier / Company info ---
-            result.supplier = {
-                name: seller.companyName || '',
-                country: seller.companyRegisterCountry || '',
-                businessType: seller.companyBusinessType || '',
-                yearsOnAlibaba: seller.companyJoinYears || 0,
-                contactName: seller.contactName || '',
-                responseTime: seller.responseTimeText || '',
-                onTimeDelivery: seller.supplierOnTimeDeliveryRate || '',
-                logo: seller.companyLogoFileUrlSmall || '',
-                profileUrl: seller.companyProfileUrl || '',
-            };
-
-            // Mini company card extra data
-            const mcc = nm.module_mini_company_card;
-            if (mcc && mcc.privateData) {
-                const pd = mcc.privateData;
-                result.supplier.rating = pd.storeRatingScore || '';
-                result.supplier.reviewCount = pd.storeReviewText || '';
-                result.supplier.reorderRate = pd.reorderRateValue || '';
-                result.supplier.countryName = pd.countryName || '';
-                result.supplier.countryFlag = pd.countryFlagImg || '';
-            }
-
-            // --- Shipping / origin info ---
-            const shipFrom = trade.shipFromInfo || {};
-            result.shipFrom = shipFrom.shipFromCountryText || '';
-
-            // --- Trade info ---
-            const tradeInfo = trade.tradeInfo || {};
-            result.moq = product.moq || 1;
-            result.quantityUnit = tradeInfo.quantityUnitStr || '';
-
-            // --- Packaging info from sorted attributes ---
-            if (sortedAttr && sortedAttr.privateData) {
-                const sorted = sortedAttr.privateData.productSortedProperties || [];
-                sorted.forEach(group => {
-                    if (group.title && group.title.toLowerCase().includes('packag')) {
-                        const pkg = {};
-                        (group.attributeList || []).forEach(a => {
-                            pkg[a.attribute] = a.value;
-                        });
-                        result.packaging = pkg;
+                // Images
+                const images = [];
+                const imgSeen = new Set();
+                (product.mediaItems || product.imageList || []).forEach(m => {
+                    let url = '';
+                    if (typeof m === 'string') url = m;
+                    else if (m.imageUrl) {
+                        url = typeof m.imageUrl === 'object'
+                            ? (m.imageUrl.big || m.imageUrl.normal || '') : m.imageUrl;
+                    } else url = m.bigUrl || m.url || m.src || '';
+                    url = upgradeImg(url);
+                    if (url && url.startsWith('http') && !imgSeen.has(url)) {
+                        imgSeen.add(url); images.push(url);
                     }
                 });
+                ['image','mainImage','productImage'].forEach(f => {
+                    const obj = product[f];
+                    if (obj && typeof obj === 'object' && obj.images) {
+                        obj.images.forEach(img => {
+                            const u = upgradeImg(typeof img === 'string' ? img
+                                : (img.fullPathImageURI||img.originalImageURI||img.bigUrl||img.url||''));
+                            if (u && u.startsWith('http') && !imgSeen.has(u)) {
+                                imgSeen.add(u); images.push(u);
+                            }
+                        });
+                    }
+                });
+                result.images = images;
+
+                // Price tiers
+                const price = product.price || product.customPrice || {};
+                result.priceTiers = (price.productLadderPrices || price.ladderPrices || []).map(t => ({
+                    min: t.min, max: t.max,
+                    price: t.price || t.dollarPrice,
+                    formatted: t.formatPrice || ''
+                }));
+                result.priceRange = price.formatLadderPrice || price.priceRange || '';
+
+                // SKU attributes
+                const sku = product.sku || product.skuModel || {};
+                const skuAttrs = sku.skuAttrs || sku.skuSummaryAttrs || sku.productSKUPropertyList || [];
+                result.skuAttributes = skuAttrs.map(a => ({
+                    name: a.name || a.skuPropertyName || '',
+                    values: (a.values || a.skuPropertyValues || []).map(v => ({
+                        id: v.id || v.propertyValueId || v.propertyValueIdLong,
+                        name: v.name || v.propertyValueDisplayName || v.propertyValueName || '',
+                        color: v.color || '',
+                        imageUrl: upgradeImg(v.imageUrl || v.skuPropertyImagePath || '')
+                    }))
+                }));
+                result.skuInfoMap = sku.skuInfoMap || sku.skuPriceList || {};
+
+                // Attributes / specs
+                const attrs = {};
+                const seen = new Set();
+                [
+                    product.productBasicProperties || [],
+                    product.productOtherProperties || [],
+                    product.productProperties || [],
+                    product.attributes || []
+                ].forEach(list => list.forEach(p => {
+                    const k = (p.attrName||p.attributeName||p.name||'').trim();
+                    const v = (p.attrValue||p.attributeValue||p.value||'').trim();
+                    if (k && v && !seen.has(k)) { seen.add(k); attrs[k] = v; }
+                }));
+                const sa = nm.module_sorted_attribute;
+                if (sa && sa.privateData) {
+                    (sa.privateData.productSortedProperties||[]).forEach(g => {
+                        (g.attributeList||[]).forEach(a => {
+                            const k = (a.attribute||'').trim();
+                            const v = (a.value||'').trim();
+                            if (k && v && !seen.has(k)) { seen.add(k); attrs[k] = v; }
+                        });
+                    });
+                }
+                result.attributes = attrs;
+
+                result.keyProperties = (product.productKeyIndustryProperties||[]).map(
+                    p => ({name: p.attrName, value: p.attrValue})
+                );
+
+                // Supplier
+                result.supplier = {
+                    name: seller.companyName||seller.storeName||'',
+                    country: seller.companyRegisterCountry||seller.country||'',
+                    businessType: seller.companyBusinessType||'',
+                    yearsOnAlibaba: seller.companyJoinYears||0,
+                    contactName: seller.contactName||'',
+                    responseTime: seller.responseTimeText||'',
+                    onTimeDelivery: seller.supplierOnTimeDeliveryRate||'',
+                    logo: seller.companyLogoFileUrlSmall||seller.logo||'',
+                    profileUrl: seller.companyProfileUrl||seller.storeUrl||'',
+                };
+                const mcc = nm.module_mini_company_card;
+                if (mcc && mcc.privateData) {
+                    const pd = mcc.privateData;
+                    result.supplier.rating = pd.storeRatingScore||'';
+                    result.supplier.reviewCount = pd.storeReviewText||'';
+                    result.supplier.reorderRate = pd.reorderRateValue||'';
+                }
+
+                // Trade
+                const shipFrom = trade.shipFromInfo||{};
+                result.shipFrom = shipFrom.shipFromCountryText||'';
+                result.moq = product.moq||product.minOrderQuantity||1;
+                result.quantityUnit = (trade.tradeInfo||{}).quantityUnitStr||'';
+
+                // Packaging
+                if (sa && sa.privateData) {
+                    (sa.privateData.productSortedProperties||[]).forEach(g => {
+                        if (g.title && g.title.toLowerCase().includes('packag')) {
+                            const pkg = {};
+                            (g.attributeList||[]).forEach(a => { pkg[a.attribute] = a.value; });
+                            result.packaging = pkg;
+                        }
+                    });
+                }
+
+                // Logistics
+                const log = trade.logisticInfo||{};
+                if (log.unitWeight) result.unitWeight = log.unitWeight;
+                if (log.unitVolume) result.unitVolume = log.unitVolume;
+                if (log.unitSize) result.unitSize = log.unitSize;
+
+                return result;
             }
 
-            // --- Logistics info ---
-            const logistic = trade.logisticInfo || {};
-            if (logistic.unitWeight) result.unitWeight = logistic.unitWeight;
-            if (logistic.unitVolume) result.unitVolume = logistic.unitVolume;
-            if (logistic.unitSize) result.unitSize = logistic.unitSize;
-
-            return result;
+            // Source 1: window.detailData
+            const dd = window.detailData;
+            if (dd && dd.globalData) {
+                const gd = dd.globalData;
+                const r = extract(gd.product||{}, gd.seller||{}, gd.trade||{}, dd.nodeMap||{});
+                r._source = 'detailData'; return r;
+            }
+            // Source 2: window.runParams
+            if (window.runParams) {
+                const rp = window.runParams;
+                const d = rp.data||rp;
+                const r = extract(d.productInfoComponent||d.productInfo||d.itemInfoComponent||d,
+                    d.sellerComponent||d.seller||d.storeInfo||{},
+                    d.shippingComponent||d.trade||{}, {});
+                r._source = 'runParams'; return r;
+            }
+            // Source 3: window.__INIT_DATA__
+            if (window.__INIT_DATA__) {
+                const id = window.__INIT_DATA__;
+                const d = id.data||id;
+                const r = extract(d.product||d.productInfo||d,
+                    d.seller||d.storeInfo||{}, d.trade||d.shipping||{}, {});
+                r._source = '__INIT_DATA__'; return r;
+            }
+            // Source 4: window.PAGE_DATA
+            if (window.PAGE_DATA) {
+                const pd = window.PAGE_DATA;
+                const r = extract(pd.product||pd.productInfo||pd,
+                    pd.seller||pd.store||{}, {}, {});
+                r._source = 'PAGE_DATA'; return r;
+            }
+            // Source 5: <script> tags
+            for (const s of document.querySelectorAll('script')) {
+                const t = s.textContent||'';
+                for (const pat of [
+                    /window\\.detailData\\s*=\\s*(\\{[\\s\\S]*?\\});/,
+                    /window\\.runParams\\s*=\\s*(\\{[\\s\\S]*?\\});/
+                ]) {
+                    const m = t.match(pat);
+                    if (m) {
+                        try {
+                            const p = JSON.parse(m[1]);
+                            const prod = p.globalData?.product || p.data?.productInfoComponent || p;
+                            const r = extract(prod, p.globalData?.seller||p.data?.sellerComponent||{}, {}, {});
+                            if (r.title || r.images.length > 0) { r._source = 'script_tag'; return r; }
+                        } catch(e) {}
+                    }
+                }
+            }
+            return null;
         }""")
 
-        # If detailData extraction failed, fall back to basic DOM extraction
-        if not detail:
-            logger.warning("detailData not found for %s, falling back to DOM", url[:60])
-            detail = await self._extract_from_dom(page)
-
-        if detail:
-            # --- Extract description from iframe ---
-            desc_text = await self._extract_description(page)
-            if desc_text:
-                detail["description"] = desc_text
-
-            detail["source_url"] = url
-            logger.info(
-                "  Detail extracted: %s | %d images | %d attrs | %d variants | desc=%d chars",
-                (detail.get("title") or "?")[:50],
-                len(detail.get("images", [])),
-                len(detail.get("attributes", {})),
-                len(detail.get("skuAttributes", [])),
-                len(detail.get("description", "")),
-            )
-        return detail
+    # ------------------------------------------------------------------
+    # Description extraction
+    # ------------------------------------------------------------------
 
     async def _extract_description(self, page: Page) -> str:
         """Extract product description from the lazy-loaded iframe."""
         try:
-            # Scroll to the bottom to trigger lazy-load of description iframe
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
 
-            # Log available frames for debugging
-            frame_urls = [f.url for f in page.frames if f.url and f.url != "about:blank"]
-            logger.debug("Available frames (%d): %s", len(frame_urls), [u[:80] for u in frame_urls])
-
-            # Try waiting for the iframe to appear
+            # Try iframe
             desc_frame = None
             for _ in range(3):
                 for frame in page.frames:
@@ -724,105 +856,257 @@ class AlibabaScraper:
                         break
                 if desc_frame:
                     break
-                # Scroll more to trigger lazy load
                 await page.evaluate("window.scrollBy(0, 500)")
                 await page.wait_for_timeout(1500)
 
             if desc_frame:
-                await desc_frame.wait_for_load_state("domcontentloaded", timeout=10000)
+                try:
+                    await desc_frame.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
                 await page.wait_for_timeout(1000)
-                text = await desc_frame.evaluate("""() => {
-                    return document.body ? document.body.innerText.trim().substring(0, 5000) : '';
-                }""")
+                text = await desc_frame.evaluate(
+                    "() => document.body ? document.body.innerText.trim().substring(0, 5000) : ''"
+                )
                 if text and len(text) > 20:
-                    logger.debug("Description from iframe: %d chars", len(text))
                     return text
-            else:
-                logger.debug("No description iframe found")
 
-            # Fallback: try extracting via productId-based API
+            # Fallback: productId API
             product_id = await page.evaluate("""() => {
                 const dd = window.detailData;
-                return dd && dd.globalData && dd.globalData.product
-                    ? dd.globalData.product.productId || '' : '';
+                if (dd && dd.globalData && dd.globalData.product)
+                    return dd.globalData.product.productId || '';
+                if (window.runParams) {
+                    const d = (window.runParams.data || window.runParams);
+                    const pi = d.productInfoComponent || d.productInfo || d;
+                    if (pi.productId) return pi.productId;
+                }
+                const m = window.location.href.match(/_(\\d+)\\.html/);
+                return m ? m[1] : '';
             }""")
             if product_id:
-                desc_url = f"https://www.alibaba.com/product-detail/description/descIframe.html?productId={product_id}"
                 try:
+                    desc_url = f"https://www.alibaba.com/product-detail/description/descIframe.html?productId={product_id}"
                     resp = await page.context.request.get(desc_url, timeout=10000)
                     if resp.ok:
                         html = await resp.text()
                         text = await page.evaluate("""(html) => {
-                            const div = document.createElement('div');
-                            div.innerHTML = html;
-                            return div.innerText.trim().substring(0, 5000);
+                            const d = document.createElement('div'); d.innerHTML = html;
+                            return d.innerText.trim().substring(0, 5000);
                         }""", html)
                         if text and len(text) > 20:
-                            logger.debug("Description from API fetch: %d chars", len(text))
                             return text
-                except Exception as e:
-                    logger.debug("Description API fetch failed: %s", e)
+                except Exception:
+                    pass
 
-            # Fallback: try extracting description from detailData nodeMap
+            # Fallback: nodeMap
             text = await page.evaluate("""() => {
                 const dd = window.detailData;
                 if (dd && dd.nodeMap) {
-                    const descMod = dd.nodeMap.module_description || dd.nodeMap.module_product_description;
-                    if (descMod && descMod.privateData) {
-                        const html = descMod.privateData.descriptionContent || descMod.privateData.content || '';
-                        if (html) {
-                            const div = document.createElement('div');
-                            div.innerHTML = html;
-                            return div.innerText.trim().substring(0, 5000);
-                        }
+                    const dm = dd.nodeMap.module_description || dd.nodeMap.module_product_description;
+                    if (dm && dm.privateData) {
+                        const html = dm.privateData.descriptionContent || dm.privateData.content || '';
+                        if (html) { const d = document.createElement('div'); d.innerHTML = html;
+                            return d.innerText.trim().substring(0, 5000); }
                     }
                 }
                 return '';
             }""")
             if text and len(text) > 20:
-                logger.debug("Description from nodeMap: %d chars", len(text))
                 return text
 
-            # Fallback: try detailModule on main page
+            # Fallback: DOM
             text = await page.evaluate("""() => {
-                const el = document.querySelector('.detailModule, [class*="detail-decorate"], [class*="product-description"]');
+                const el = document.querySelector(
+                    '.detailModule, [class*="detail-decorate"], [class*="product-description"], '
+                    + '[class*="rich-text"], [class*="desc-module"]');
                 return el ? el.innerText.trim().substring(0, 5000) : '';
             }""")
             if text and len(text) > 20:
-                logger.debug("Description from DOM: %d chars", len(text))
                 return text
         except Exception as e:
             logger.debug("Description extraction failed: %s", e)
         return ""
 
-    async def _extract_from_dom(self, page: Page) -> dict | None:
-        """Fallback DOM-based extraction if window.detailData is not available."""
-        return await page.evaluate("""() => {
-            const result = {};
-            const h1 = document.querySelector('h1');
-            if (h1) result.title = h1.innerText.trim();
+    # ------------------------------------------------------------------
+    # Description images
+    # ------------------------------------------------------------------
 
-            const images = [];
-            const seen = new Set();
-            document.querySelectorAll(
-                '.main-image img, .detail-gallery img, [class*="gallery"] img, ' +
-                '.magic-gallery img, .img-sequence img, .thumb-list img'
-            ).forEach(img => {
-                let src = img.getAttribute('src') || img.getAttribute('data-src') || '';
-                if (src.startsWith('//')) src = 'https:' + src;
-                src = src.replace(/_\\d+x\\d+\\.\\w+(\\?.*)?$/, '');
-                if (src && src.startsWith('http') && !seen.has(src)) {
-                    seen.add(src);
-                    images.push(src);
+    async def _extract_description_images(self, page: Page) -> list[str]:
+        """Pull product images from the description iframe/section."""
+        try:
+            images, seen = [], set()
+            for frame in page.frames:
+                if "descIframe" in frame.url or "desc" in frame.url.lower():
+                    try:
+                        fi = await frame.evaluate("""() => {
+                            const r = [];
+                            document.querySelectorAll('img').forEach(i => {
+                                let s = i.src || i.getAttribute('data-src') || '';
+                                if (s.startsWith('//')) s = 'https:' + s;
+                                if (s.startsWith('http') && !s.includes('icon') &&
+                                    (s.includes('kf/')||s.includes('imgextra')||s.includes('cbu01')))
+                                    r.push(s);
+                            }); return r;
+                        }""")
+                        for img in fi:
+                            if img not in seen:
+                                seen.add(img); images.append(img)
+                    except Exception:
+                        pass
+                    break
+            di = await page.evaluate("""() => {
+                const r = [];
+                const el = document.querySelector(
+                    '.detailModule, [class*="detail-decorate"], [class*="product-description"]');
+                if (el) el.querySelectorAll('img').forEach(i => {
+                    let s = i.src || i.getAttribute('data-src') || '';
+                    if (s.startsWith('//')) s = 'https:' + s;
+                    if (s.startsWith('http') && !s.includes('icon') &&
+                        (s.includes('kf/')||s.includes('imgextra')||s.includes('cbu01')))
+                        r.push(s);
+                }); return r;
+            }""")
+            for img in di:
+                if img not in seen:
+                    seen.add(img); images.append(img)
+            return images
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------
+    # DOM gallery images
+    # ------------------------------------------------------------------
+
+    async def _extract_gallery_images_from_dom(self, page: Page) -> list[str]:
+        """Extract all product gallery images from the DOM."""
+        return await page.evaluate("""() => {
+            function up(u) {
+                if (!u) return '';
+                u = u.replace(/_\\d+x\\d+\\.\\w+(\\?.*)?$/, '');
+                if (u.startsWith('//')) u = 'https:' + u;
+                return u;
+            }
+            const imgs = [], seen = new Set();
+            const sels = [
+                '.main-image img', '.detail-gallery img', '[class*="gallery"] img',
+                '.magic-gallery img', '.img-sequence img', '.thumb-list img',
+                '[class*="image-view"] img', '[class*="slider"] img',
+                '[class*="carousel"] img', '[class*="swiper"] img',
+                '.product-image img', '[class*="main-image"] img',
+                '[class*="sku-image"] img', 'video[poster]'
+            ];
+            document.querySelectorAll(sels.join(',')).forEach(el => {
+                let s = el.tagName === 'VIDEO' ? (el.poster||'')
+                    : (el.getAttribute('data-big')||el.getAttribute('data-zoom-image')
+                       ||el.getAttribute('data-original')||el.getAttribute('data-src')
+                       ||el.getAttribute('src')||'');
+                s = up(s);
+                if (s && s.startsWith('http') && !seen.has(s)
+                    && !s.includes('icon') && !s.includes('logo')
+                    && (s.includes('kf/')||s.includes('imgextra')||s.includes('alicdn')||s.includes('cbu01'))) {
+                    seen.add(s); imgs.push(s);
                 }
             });
-            result.images = images;
-            result.attributes = {};
-            result.skuAttributes = [];
-            result.priceTiers = [];
-            result.supplier = {};
-            return result;
+            if (imgs.length < 3) {
+                document.querySelectorAll('img').forEach(i => {
+                    const s = up(i.getAttribute('data-big')||i.getAttribute('data-zoom-image')
+                        ||i.getAttribute('data-original')||i.getAttribute('data-src')
+                        ||i.getAttribute('src')||'');
+                    if (s && s.startsWith('http') && !seen.has(s)
+                        && (s.includes('kf/')||s.includes('imgextra')||s.includes('cbu01'))
+                        && !s.includes('icon') && !s.includes('logo')
+                        && (i.naturalWidth > 100 || !i.complete)) {
+                        seen.add(s); imgs.push(s);
+                    }
+                });
+            }
+            return imgs;
         }""")
+
+    # ------------------------------------------------------------------
+    # DOM attribute / spec extraction
+    # ------------------------------------------------------------------
+
+    async def _extract_attributes_from_dom(self, page: Page) -> dict:
+        """Extract product attributes/specs from DOM tables and lists."""
+        return await page.evaluate("""() => {
+            const a = {}, seen = new Set();
+            function add(k, v) {
+                k = (k||'').trim().replace(/\\s*:\\s*$/, '');
+                v = (v||'').trim();
+                if (k && v && !seen.has(k.toLowerCase())) { seen.add(k.toLowerCase()); a[k] = v; }
+            }
+            // Tables
+            document.querySelectorAll(
+                'table[class*="attr"], table[class*="spec"], table[class*="property"], '
+                + '[class*="do-entry-list"] table, .detail-attributes table, '
+                + '[class*="specification"] table, [class*="attribute"] table'
+            ).forEach(t => t.querySelectorAll('tr').forEach(r => {
+                const c = r.querySelectorAll('td, th');
+                if (c.length >= 2) add(c[0].innerText, c[1].innerText);
+                if (c.length >= 4) add(c[2].innerText, c[3].innerText);
+            }));
+            // Key-value items
+            document.querySelectorAll(
+                '[class*="do-entry-item"], [class*="property-item"], [class*="attr-item"], '
+                + '[class*="spec-item"], [class*="attribute-item"], [class*="product-property"] li'
+            ).forEach(item => {
+                const ke = item.querySelector('[class*="entry-key"],[class*="attr-name"],[class*="prop-name"],[class*="name"],dt,.key,th');
+                const ve = item.querySelector('[class*="entry-value"],[class*="attr-value"],[class*="prop-value"],[class*="value"],dd,.val,td');
+                if (ke && ve) add(ke.innerText, ve.innerText);
+                else {
+                    const t = item.innerText.trim(), ci = t.indexOf(':');
+                    if (ci > 0 && ci < 60) add(t.substring(0, ci), t.substring(ci+1));
+                }
+            });
+            return a;
+        }""")
+
+    # ------------------------------------------------------------------
+    # Full DOM fallback
+    # ------------------------------------------------------------------
+
+    async def _extract_from_dom(self, page: Page) -> dict | None:
+        """Fallback DOM-based extraction if no JS data is available."""
+        images = await self._extract_gallery_images_from_dom(page)
+        attrs = await self._extract_attributes_from_dom(page)
+
+        result = await page.evaluate("""() => {
+            const r = {};
+            for (const sel of ['h1','.product-title','.module-pdp-title','[class*="product-name"]']) {
+                const el = document.querySelector(sel);
+                if (el && el.innerText.trim()) { r.title = el.innerText.trim(); break; }
+            }
+            // SKU from DOM
+            const skus = [];
+            document.querySelectorAll(
+                '[class*="sku-prop"],[class*="sku-attr"],[class*="product-sku"],[class*="variant"],[class*="prop-item"]'
+            ).forEach(g => {
+                const ne = g.querySelector('[class*="name"],[class*="label"],[class*="title"],dt,.key');
+                const name = ne ? ne.innerText.trim().replace(/:$/, '') : '';
+                const vals = [];
+                g.querySelectorAll('[class*="value"] a,[class*="value"] span,[class*="option"],li,[class*="thumb"]').forEach(v => {
+                    const vn = v.getAttribute('title') || v.innerText.trim();
+                    const vi = v.querySelector('img');
+                    if (vn) vals.push({name: vn, imageUrl: vi ? (vi.src||'') : ''});
+                });
+                if (name && vals.length) skus.push({name, values: vals});
+            });
+            r.skuAttributes = skus;
+            // Price
+            for (const sel of ['[class*="price"] [class*="num"]','[class*="price-range"]','.price']) {
+                const el = document.querySelector(sel);
+                if (el && el.innerText.trim()) { r.priceRange = el.innerText.trim(); break; }
+            }
+            r.priceTiers = []; r.supplier = {}; r.skuInfoMap = {};
+            return r;
+        }""")
+
+        if result:
+            result["images"] = images
+            result["attributes"] = attrs
+        return result
 
     # -----------------------------------------------------------------------
     # Build final product documents — matches target schema

@@ -12,6 +12,7 @@ from .proxy import fetch_webshare_proxies
 from .cloudflare import CloudflareUploader
 from .database import MongoStorage
 from .scrapers import AlibabaScraper
+from .captcha.solver import detect_captcha
 
 logging.basicConfig(
     level=logging.INFO,
@@ -253,80 +254,74 @@ async def run():
             )
             new_raw = new_raw[:settings.DETAIL_LIMIT]
 
-        # --- Phase 2: Detail pages (if enabled) ---
+        # --- Phase 2: Detail pages — reuse a warm context to avoid CAPTCHA ---
         details_map: dict[str, dict] = {}
 
         if settings.SCRAPE_DETAILS and new_raw:
             logger.info(
-                "SCRAPE_DETAILS enabled — visiting %d detail pages with %d workers (delay %d-%ds)",
-                len(new_raw), settings.DETAIL_WORKERS, settings.DETAIL_DELAY_MIN, settings.DETAIL_DELAY_MAX,
+                "SCRAPE_DETAILS enabled — visiting %d detail pages (same-session, delay %d-%ds)",
+                len(new_raw), settings.DETAIL_DELAY_MIN, settings.DETAIL_DELAY_MAX,
             )
 
             success = 0
             failed = 0
-            completed = 0
-            sem = asyncio.Semaphore(settings.DETAIL_WORKERS)
-            results_lock = asyncio.Lock()
 
-            async def _scrape_one(raw: dict):
-                nonlocal success, failed, completed
+            # Create one warm context — browse the store listing page first
+            # so the session has Alibaba cookies/trust, then visit detail pages
+            # in the same context.  This dramatically reduces CAPTCHA triggers.
+            warm_ctx_opts = {
+                "user_agent": scraper.pick_ua(),
+                "viewport": {"width": 1920, "height": 1080},
+                "locale": "en-US",
+                "timezone_id": "Europe/Stockholm",
+                "geolocation": {"latitude": 59.3293, "longitude": 18.0686},
+                "permissions": ["geolocation"],
+            }
+            warm_ctx = await browser.new_context(**warm_ctx_opts)
+            await _set_sweden_cookies(warm_ctx)
+            await warm_ctx.add_init_script(AlibabaScraper.stealth_js)
+
+            # Warm-up: visit the store homepage to build session trust
+            warm_page = await warm_ctx.new_page()
+            try:
+                logger.info("  Warming up session on store homepage…")
+                await warm_page.goto(settings.BASE_URL, wait_until="domcontentloaded", timeout=30000)
+                await warm_page.wait_for_timeout(3000)
+                # Solve CAPTCHA if store homepage triggers one (unlikely)
+                if captcha_solver and await detect_captcha(warm_page):
+                    await captcha_solver.solve_slider(warm_page)
+                    await warm_page.wait_for_timeout(2000)
+            except Exception as e:
+                logger.warning("  Warm-up navigation failed (non-fatal): %s", e)
+
+            for idx, raw in enumerate(new_raw, 1):
                 url = raw.get("url", "")
                 if not url:
-                    return
+                    continue
 
-                async with sem:
-                    detail = None
-                    # Always rotate to a fresh proxy for every attempt
-                    max_proxy_retries = min(len(proxies), 5) if proxies else 1
-                    total_attempts = max_proxy_retries + 1  # +1 for direct fallback
-                    for attempt in range(total_attempts):
-                        # Last attempt: try without any proxy
-                        if attempt == total_attempts - 1 and proxies:
-                            ctx_opts = {
-                                "user_agent": scraper.pick_ua(),
-                                "viewport": {"width": 1920, "height": 1080},
-                                "locale": "en-US",
-                                "timezone_id": "Europe/Stockholm",
-                                "geolocation": {"latitude": 59.3293, "longitude": 18.0686},
-                                "permissions": ["geolocation"],
-                            }
-                            logger.info("  Detail attempt %d/%d (direct, no proxy): %s", attempt + 1, total_attempts, url[:60])
-                        else:
-                            ctx_opts = await _make_context_opts()
-                            proxy_label = ctx_opts.get("proxy", {}).get("server", "direct") if proxies else "direct"
-                            logger.info("  Detail attempt %d/%d via %s: %s", attempt + 1, total_attempts, proxy_label, url[:60])
+                logger.info("  Detail %d/%d: %s", idx, len(new_raw), url[:70])
+                detail = await scraper.scrape_detail_page(
+                    warm_page, url, captcha_solver=captcha_solver,
+                )
 
-                        ctx = await browser.new_context(**ctx_opts)
-                        await _set_sweden_cookies(ctx)
-                        await ctx.add_init_script(AlibabaScraper.stealth_js)
-                        detail_page = await ctx.new_page()
+                if detail:
+                    details_map[url] = detail
+                    success += 1
+                else:
+                    failed += 1
 
-                        detail = await scraper.scrape_detail_page(
-                            detail_page, url, captcha_solver=captcha_solver,
-                        )
-                        await ctx.close()
+                logger.info(
+                    "  Detail progress: %d/%d (ok=%d, fail=%d)",
+                    idx, len(new_raw), success, failed,
+                )
 
-                        if detail is not None:
-                            break
-
-                    async with results_lock:
-                        if detail:
-                            details_map[url] = detail
-                            success += 1
-                        else:
-                            failed += 1
-                        completed += 1
-                        logger.info(
-                            "  Detail progress: %d/%d (ok=%d, fail=%d)",
-                            completed, len(new_raw), success, failed,
-                        )
-
-                    # Human-like delay so each worker pauses between its own requests
+                # Human-like delay between products
+                if idx < len(new_raw):
                     await scraper.random_delay(
                         settings.DETAIL_DELAY_MIN, settings.DETAIL_DELAY_MAX,
                     )
 
-            await asyncio.gather(*[_scrape_one(r) for r in new_raw])
+            await warm_ctx.close()
 
             logger.info(
                 "Detail scraping complete: %d succeeded, %d failed", success, failed,
