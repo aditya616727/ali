@@ -239,6 +239,97 @@ class AlibabaScraper:
             return False
 
     # -----------------------------------------------------------------------
+    # Language & currency selector — click globe icon and pick English + SEK
+    # -----------------------------------------------------------------------
+
+    async def set_language_and_currency(self, page: Page, language: str = "English", currency: str = "SEK") -> bool:
+        """Click the globe icon (#icon-global) to open language/currency popup,
+        set language to English and currency to SEK, then save.
+
+        The popup uses two react-select dropdowns:
+          - #react-select-2-input  → Language
+          - #react-select-3-input  → Currency
+        and a <div class="tnh-button">Save</div> button.
+
+        Returns True if changed successfully, False on failure.
+        """
+        try:
+            # --- Step 1: Find and click the globe icon to open the popup ---
+            globe = page.locator('use[xlink\\:href="#icon-global"]').first
+            if not await globe.is_visible(timeout=3000):
+                globe = page.locator('svg:has(use[*|href="#icon-global"])').first
+                if not await globe.is_visible(timeout=2000):
+                    logger.warning("Globe icon not found on page")
+                    return False
+
+            parent = globe.locator('..')
+            await parent.click()
+            await page.wait_for_timeout(2000)
+
+            # Verify popup opened
+            popup = page.locator('.tnh-languages-overlay').first
+            if not await popup.is_visible(timeout=3000):
+                logger.warning("Language/currency popup did not open")
+                return False
+
+            # --- Step 2: Set language via react-select-2-input ---
+            lang_input = page.locator('#react-select-2-input').first
+            if await lang_input.is_visible(timeout=2000):
+                await lang_input.click()
+                await page.wait_for_timeout(300)
+                await lang_input.fill("")
+                await lang_input.type(language, delay=60)
+                await page.wait_for_timeout(1000)
+                # Select the matching option from dropdown
+                lang_option = page.locator(f'[id*="react-select-2-option"]:has-text("{language}")').first
+                if not await lang_option.is_visible(timeout=2000):
+                    lang_option = page.locator(f'[class*="menu"] div:has-text("{language}")').first
+                if await lang_option.is_visible(timeout=1000):
+                    await lang_option.click()
+                    await page.wait_for_timeout(500)
+                    logger.info("  Language set to %s", language)
+                else:
+                    logger.warning("  Language option '%s' not found in dropdown", language)
+            else:
+                logger.warning("  Language react-select input not found")
+
+            # --- Step 3: Set currency via react-select-3-input ---
+            cur_input = page.locator('#react-select-3-input').first
+            if await cur_input.is_visible(timeout=2000):
+                await cur_input.click()
+                await page.wait_for_timeout(300)
+                await cur_input.fill("")
+                await cur_input.type(currency, delay=60)
+                await page.wait_for_timeout(1000)
+                # Select the matching option from dropdown
+                cur_option = page.locator(f'[id*="react-select-3-option"]:has-text("{currency}")').first
+                if not await cur_option.is_visible(timeout=2000):
+                    cur_option = page.locator(f'[class*="menu"] div:has-text("{currency}")').first
+                if await cur_option.is_visible(timeout=1000):
+                    await cur_option.click()
+                    await page.wait_for_timeout(500)
+                    logger.info("  Currency set to %s", currency)
+                else:
+                    logger.warning("  Currency option '%s' not found in dropdown", currency)
+            else:
+                logger.warning("  Currency react-select input not found")
+
+            # --- Step 4: Click Save (div.tnh-button) ---
+            save_btn = page.locator('.tnh-button:has-text("Save")').first
+            if await save_btn.is_visible(timeout=2000):
+                await save_btn.click()
+                await page.wait_for_timeout(5000)
+                logger.info("Language/currency saved: lang=%s, currency=%s", language, currency)
+                return True
+            else:
+                logger.warning("Save button (.tnh-button) not found in popup")
+                return False
+
+        except Exception as e:
+            logger.warning("set_language_and_currency failed: %s", e)
+            return False
+
+    # -----------------------------------------------------------------------
     # Listing page scraper
     # -----------------------------------------------------------------------
 
@@ -553,6 +644,25 @@ class AlibabaScraper:
 
             # Success — proceed to extraction
             logger.info("  Content ready via [%s]", label)
+
+            # Switch language to English and currency to SEK via globe icon
+            locale_ok = await self.set_language_and_currency(page, "English", "SEK")
+            if locale_ok:
+                # Page reloaded — wait for content again
+                try:
+                    await page.wait_for_function(
+                        """() => !!(
+                            (window.detailData && window.detailData.globalData) ||
+                            window.runParams ||
+                            window.__INIT_DATA__ ||
+                            window.PAGE_DATA ||
+                            document.querySelector('h1, .product-title, .module-pdp-title')
+                        )""",
+                        timeout=20000,
+                    )
+                    logger.info("  Content re-loaded after locale change")
+                except Exception:
+                    logger.warning("  Content not ready after locale change — extracting anyway")
 
             # Scroll aggressively to trigger lazy-load of images, desc, specs
             for _ in range(8):
