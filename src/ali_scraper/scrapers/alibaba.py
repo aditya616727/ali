@@ -1242,6 +1242,7 @@ class AlibabaScraper:
             return {
                 "source_url": raw.get("url", ""),
                 "isPosted": False,
+                "type": "ecommerce",
                 "category": "Fitness & Sports",
                 "subcategory": "Outdoor Activities",
                 "postAdData": {
@@ -1453,6 +1454,7 @@ class AlibabaScraper:
         return {
             "source_url": raw.get("url", ""),
             "isPosted": False,
+            "type": "ecommerce",
             "category": "Fitness & Sports",
             "subcategory": "Outdoor Activities",
             "postAdData": {
