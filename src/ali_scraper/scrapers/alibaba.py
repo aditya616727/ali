@@ -1262,20 +1262,22 @@ class AlibabaScraper:
 
         title = raw.get("title", "")
         price_text = raw.get("priceText", "") or raw.get("priceTitle", "")
-        price_low, price_high = AlibabaScraper.extract_price_range(price_text)
+        price_low = price_text
+        price_high = price_text
 
         # Prefer priceTiers from detail page — they are more accurate than listing DOM text.
-        # Use the tier with the lowest minimum quantity (i.e. the single-unit price).
+        # Keep the original formatted string (e.g. '5 459,76 kr') as-is.
         if detail:
             tiers = detail.get("priceTiers") or []
             if tiers:
-                # Sort by min quantity ascending; pick the first tier's price
                 sorted_tiers = sorted(tiers, key=lambda t: t.get("min", 0))
-                tier_price = sorted_tiers[0].get("price", 0)
-                if tier_price and tier_price > 0:
-                    price_low = tier_price
-                    # High price = largest-quantity (bulk) tier
-                    price_high = sorted_tiers[-1].get("price", tier_price) or price_low
+                # Use formatted string if available, otherwise fall back to raw price
+                fmt_low = sorted_tiers[0].get("formatted", "")
+                fmt_high = sorted_tiers[-1].get("formatted", "")
+                raw_low = sorted_tiers[0].get("price", "")
+                raw_high = sorted_tiers[-1].get("price", "")
+                price_low = fmt_low or str(raw_low) if raw_low else price_low
+                price_high = fmt_high or str(raw_high) if raw_high else price_high
 
         # Use detail title if longer/better
         if detail.get("title") and len(detail["title"]) > len(title):
@@ -1328,7 +1330,7 @@ class AlibabaScraper:
                 if variant_name:
                     variants.append({
                         "name": variant_name,
-                        "price": price_low,
+                        "price": str(price_low),
                         "attributes": variant_attrs,
                         "images": [img["url"] for img in images],
                     })
@@ -1373,16 +1375,16 @@ class AlibabaScraper:
 
                     variants.append({
                         "name": " / ".join(name_parts) if name_parts else f"SKU {sku_data.get('id', '')}",
-                        "price": price_low,
+                        "price": str(price_low),
                         "attributes": variant_attrs,
                         "images": variant_images if variant_images else [img["url"] for img in images],
                     })
 
-        if not variants and price_low > 0:
+        if not variants and price_low:
             base_name = title.split(",")[0].strip() if "," in title else title
             variants.append({
                 "name": base_name,
-                "price": price_low,
+                "price": str(price_low),
                 "attributes": {},
                 "images": [img["url"] for img in images],
             })
