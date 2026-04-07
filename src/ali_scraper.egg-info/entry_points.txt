@@ -1,0 +1,2 @@
+[console_scripts]
+ali-scraper = ali_scraper.cli:main

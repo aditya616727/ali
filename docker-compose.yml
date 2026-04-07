@@ -1,0 +1,23 @@
+services:
+  scraper:
+    build: .
+    image: ali-scraper:latest
+    # Use host networking so proxies and external sites are reachable
+    # without Docker bridge NAT issues (works on Linux; on Windows/Mac
+    # Docker Desktop routes traffic through the VM, so we also add dns)
+    network_mode: host
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file: .env
+    environment:
+      # Docker-specific overrides (these take precedence over .env)
+      - HEADLESS=true
+      - CHROME_SANDBOX=false
+    volumes:
+      - ./output:/app/output
+      - ./logs:/app/logs
+    shm_size: "2gb"
+    restart: "no"
